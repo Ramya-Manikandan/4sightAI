@@ -17,17 +17,19 @@ class NavigationEngine {
     private val MOVEMENT_THRESHOLD_X    = 0.12f
     private val MOVEMENT_THRESHOLD_DIST = 0.4f
 
-    // Objects within this distance of screen edges are treated as side hazards
-    // Updated to 33% / 66% as requested
-    private val CENTER_BAND_LEFT  = 0.33f
-    private val CENTER_BAND_RIGHT = 0.66f
+    // Center band for obstacle avoidance
+    private val CENTER_BAND_LEFT  = 0.30f
+    private val CENTER_BAND_RIGHT = 0.70f
 
     private var currentState       = CommandState.IDLE
     private var lastInstructedX    = -1f
     private var lastInstructedDist = -1f
     private var lastGuidanceTime   = 0L
+    private var lastClearTime      = 0L
     private var hasRepeated        = false
     private var lastInstruction: NavigationInstruction? = null
+    
+    private val CLEAR_PATH_REASSURANCE_INTERVAL = 12000L // Periodic "Path clear" every 12s
 
     var isInstructionActive = false
         private set
@@ -51,23 +53,32 @@ class NavigationEngine {
         val hasCloseObstacle  = closeObstacles.isNotEmpty()
         val hasCenterObstacle = centerObstacles.isNotEmpty()
 
+        val now = System.currentTimeMillis()
+
+        // Handle Clear Path instructions (both state transitions and periodic reassurance)
         if (!hasCloseObstacle && !hasCenterObstacle) {
-            if (!isInstructionActive) {
-                if (currentState == CommandState.WAITING_FOR_USER_MOVEMENT ||
-                    currentState == CommandState.INSTRUCTION_GIVEN) {
-                    resetState()
-                    return NavigationInstruction(
-                        "Path clear. Continue forward.",
-                        HapticManager.Urgency.CLEAR
-                    )
-                }
+            val needsTransitionClear = (currentState == CommandState.WAITING_FOR_USER_MOVEMENT || 
+                                       currentState == CommandState.INSTRUCTION_GIVEN)
+            val needsPeriodicClear = (now - lastClearTime > CLEAR_PATH_REASSURANCE_INTERVAL)
+
+            if (needsTransitionClear || (currentState == CommandState.IDLE && needsPeriodicClear)) {
+                resetState()
+                lastClearTime = now
+                return NavigationInstruction(
+                    "Path clear. Continue forward.",
+                    HapticManager.Urgency.CLEAR
+                )
             }
+            // Keep silent if already clear and not yet time for reassurance
+            return null
         }
+
+        // Reset clear path timer when an obstacle is detected
+        lastClearTime = now
 
         val closest = analysed.filter { it.second <= 6f }.minByOrNull { it.second }
 
         if (isInstructionActive && lastInstructedDist != -1f) {
-            val now = System.currentTimeMillis()
             var didMove = false
 
             if (closest != null) {
@@ -76,7 +87,8 @@ class NavigationEngine {
                 if (distShift >= MOVEMENT_THRESHOLD_DIST || centerShift >= MOVEMENT_THRESHOLD_X) {
                     didMove = true
                 }
-            } else if (!hasCloseObstacle && !hasCenterObstacle) {
+            } else {
+                // Obstacle gone
                 didMove = true
             }
 
@@ -84,7 +96,7 @@ class NavigationEngine {
                 resetState()
             } else {
                 currentState = CommandState.WAITING_FOR_USER_MOVEMENT
-                if (!hasRepeated && now - lastGuidanceTime >= 4000L) {
+                if (!hasRepeated && now - lastGuidanceTime >= 4500L) {
                     hasRepeated = true
                     lastGuidanceTime = now
                     return lastInstruction
@@ -98,32 +110,19 @@ class NavigationEngine {
         val (closestDet, closestDist) = closest
         val centerX = closestDet.centerX
 
-        // Logic based on bounding box center relative to screen width
-        val objectDirection = when {
-            centerX < CENTER_BAND_LEFT  -> "left"
-            centerX > CENTER_BAND_RIGHT -> "right"
-            else                        -> "center"
-        }
-
-        // Fix logic: if box is left, user should move RIGHT to avoid it.
-        val safeDirection = when (objectDirection) {
-            "left"   -> "right"
-            "right"  -> "left"
-            else     -> chooseSafeDirection(analysed, "center")
-        }
+        // Use balanced direction choice
+        val safeDirection = chooseSafeDirection(analysed, closestDet)
 
         val name = closestDet.label.replaceFirstChar { it.uppercase() }
         val distText = arCore.getHumanFriendlyDistance(closestDist)
-        val steps = (closestDist / STEP_LENGTH_M).roundToInt().coerceAtLeast(1)
-        val stepText = if (steps == 1) "one step" else "$steps steps"
 
         val (text, urgency) = when {
-            closestDist <= 0.8f && objectDirection == "center" -> Pair(
-                "$name ahead! STOP and move $safeDirection.",
+            closestDist <= 0.8f && centerX in CENTER_BAND_LEFT..CENTER_BAND_RIGHT -> Pair(
+                "$name directly ahead! STOP and move $safeDirection.",
                 HapticManager.Urgency.STOP
             )
             closestDist <= 1.5f -> Pair(
-                "$name close $distText. Move $safeDirection now.",
+                "$name very close $distText. Move $safeDirection now.",
                 HapticManager.Urgency.URGENT
             )
             else -> Pair(
@@ -132,11 +131,11 @@ class NavigationEngine {
             )
         }
 
-        Log.d("NavigationEngine", "Obstacle: ${closestDet.label} at x=${"%.2f".format(centerX)} ($objectDirection) -> Move $safeDirection")
+        Log.d("NavigationEngine", "Obstacle: ${closestDet.label} at x=${"%.2f".format(centerX)} -> Move $safeDirection")
 
         lastInstructedDist = closestDist
         lastInstructedX    = centerX
-        lastGuidanceTime   = System.currentTimeMillis()
+        lastGuidanceTime   = now
         currentState       = CommandState.INSTRUCTION_GIVEN
         isInstructionActive = true
         hasRepeated        = false
@@ -148,25 +147,28 @@ class NavigationEngine {
 
     private fun chooseSafeDirection(
         analysed: List<Pair<DetectionResult, Float>>,
-        obstacleDirection: String
+        closestObstacle: DetectionResult
     ): String {
-        val naturalSafe = when (obstacleDirection) {
-            "left"   -> "right"
-            "right"  -> "left"
-            else     -> "left"
-        }
+        val centerX = closestObstacle.centerX
+        
+        // If obstacle is clearly on one side, move to the other.
+        if (centerX < CENTER_BAND_LEFT) return "right"
+        if (centerX > CENTER_BAND_RIGHT) return "left"
 
-        val naturalSideBlocked = analysed.any { (det, dist) ->
-            dist <= 2f && when (naturalSafe) {
-                "right" -> det.centerX > CENTER_BAND_RIGHT
-                else    -> det.centerX < CENTER_BAND_LEFT
+        // Obstacle is in the center. Compare side clearances.
+        val leftObstacles = analysed.filter { it.first.centerX < CENTER_BAND_LEFT }
+        val rightObstacles = analysed.filter { it.first.centerX > CENTER_BAND_RIGHT }
+
+        val minLeftDist = leftObstacles.minByOrNull { it.second }?.second ?: 10f
+        val minRightDist = rightObstacles.minByOrNull { it.second }?.second ?: 10f
+
+        return when {
+            minRightDist > minLeftDist -> "right"
+            minLeftDist > minRightDist -> "left"
+            else -> {
+                // If both sides are equally clear, move away from the object's slight bias
+                if (centerX < 0.5f) "right" else "left"
             }
-        }
-
-        return if (naturalSideBlocked) {
-            if (naturalSafe == "left") "right" else "left"
-        } else {
-            naturalSafe
         }
     }
 
